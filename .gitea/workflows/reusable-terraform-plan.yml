@@ -1,0 +1,226 @@
+name: "Reusable Terraform Plan"
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Environment name (e.g., dev, prod)"
+        required: true
+        type: string
+      vm_name:
+        description: "VM name (e.g., dev01, prod01)"
+        required: true
+        type: string
+      terraform_version:
+        description: "Optional Terraform version (defaults to latest)"
+        required: false
+        type: string
+        default: ""
+      vault_path_lxd:
+        description: "KV v2 path for LXD secrets (full path after /v1/)"
+        required: false
+        type: string
+        default: "homelab/data/lxd"
+      vault_path_minio:
+        description: "KV v2 path for MinIO secrets (full path after /v1/)"
+        required: false
+        type: string
+        default: "homelab/data/minio"
+      vault_path_ansible:
+        description: "KV v2 path for Ansible secrets (full path after /v1/)"
+        required: false
+        type: string
+        default: "homelab/data/ansible"
+    secrets:
+      VAULT_ADDR:
+        required: true
+      VAULT_ROLE_ID:
+        required: true
+      VAULT_SECRET_ID:
+        required: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          clean: true  # This removes untracked files from previous runs
+
+      # -------------------------------------------------------------------
+      # Set + Validate Variables
+      # -------------------------------------------------------------------
+      - name: Set Variables
+        id: vars
+        run: |
+          ENV=$(echo "${{ inputs.environment }}" | tr '[:upper:]' '[:lower:]')
+          VM="${{ inputs.vm_name }}"
+          if [ "$ENV" != "dev" ] && [ "$ENV" != "prod" ]; then
+            echo "::error:: Invalid environment: $ENV (allowed: dev, prod)"
+            exit 1
+          fi
+          echo "env=$ENV"                                        >> $GITHUB_OUTPUT
+          echo "vm_name=$VM"                                     >> $GITHUB_OUTPUT
+          echo "working_dir=terraform/env/${ENV}"                >> $GITHUB_OUTPUT
+          echo "tfvars_file=${VM}.tfvars"                        >> $GITHUB_OUTPUT
+          echo "state_key=state/${ENV}/${VM}/terraform.tfstate"  >> $GITHUB_OUTPUT
+
+      # -------------------------------------------------------------------
+      # Validate tfvars exists
+      # -------------------------------------------------------------------
+      - name: Validate tfvars exists
+        working-directory: ${{ steps.vars.outputs.working_dir }}
+        run: |
+          FILE="${{ steps.vars.outputs.tfvars_file }}"
+          if [ ! -f "$FILE" ]; then
+            echo "::error:: tfvars file not found: $FILE"
+            exit 1
+          fi
+
+      # -------------------------------------------------------------------
+      # Fetch Secrets from OpenBao
+      # Logs in via AppRole, reads lxd/minio/ansible KV paths, exports
+      # all values to $GITHUB_ENV for every subsequent step.
+      # Multiline values (PEM certs, SSH keys) use the EOF delimiter syntax
+      # to avoid newline corruption in GITHUB_ENV.
+      # curl -sk skips TLS verification for self-signed internal certs.
+      # VAULT_ADDR/ROLE_ID/SECRET_ID come from org secrets via inherit.
+      # -------------------------------------------------------------------
+      - name: Fetch Secrets from OpenBao
+        env:
+          VAULT_ADDR:      ${{ secrets.VAULT_ADDR }}
+          VAULT_ROLE_ID:   ${{ secrets.VAULT_ROLE_ID }}
+          VAULT_SECRET_ID: ${{ secrets.VAULT_SECRET_ID }}
+          PATH_LXD:        ${{ inputs.vault_path_lxd }}
+          PATH_MINIO:      ${{ inputs.vault_path_minio }}
+          PATH_ANSIBLE:    ${{ inputs.vault_path_ansible }}
+        run: |
+          set -euo pipefail
+
+          # --- Login: exchange AppRole creds for a short-lived token ---
+          VAULT_TOKEN=$(curl -sk "${VAULT_ADDR}/v1/auth/approle/login" \
+            --data "{\"role_id\":\"${VAULT_ROLE_ID}\",\"secret_id\":\"${VAULT_SECRET_ID}\"}" \
+            | jq -r '.auth.client_token')
+
+          if [ -z "$VAULT_TOKEN" ] || [ "$VAULT_TOKEN" = "null" ]; then
+            echo "::error:: Failed to authenticate with OpenBao"
+            exit 1
+          fi
+
+          # --- Helper: read a KV v2 path, return .data.data as JSON ---
+          vault_read() {
+            RESPONSE=$(curl -sk -H "X-Vault-Token: ${VAULT_TOKEN}" \
+              "${VAULT_ADDR}/v1/$1") || {
+              echo "::error:: Failed to read vault path: $1"
+              exit 1
+            }
+            echo "$RESPONSE" | jq -r '.data.data'
+          }
+
+          LXD=$(vault_read     "$PATH_LXD")
+          MINIO=$(vault_read   "$PATH_MINIO")
+          ANSIBLE=$(vault_read "$PATH_ANSIBLE")
+
+          # --- Scalar values ---
+          echo "LXD_ADDRESS=$(echo "$LXD"        | jq -r '.address')"                  >> $GITHUB_ENV
+          echo "LXD_TRUST_PASSWORD=$(echo "$LXD"  | jq -r '.trust_password // empty')" >> $GITHUB_ENV
+          echo "MINIO_ENDPOINT=$(echo "$MINIO"    | jq -r '.endpoint')"                >> $GITHUB_ENV
+          echo "MINIO_ACCESS_KEY=$(echo "$MINIO"  | jq -r '.access_key')"              >> $GITHUB_ENV
+          echo "MINIO_SECRET_KEY=$(echo "$MINIO"  | jq -r '.secret_key')"              >> $GITHUB_ENV
+
+          # --- Multiline values: PEM certs and SSH keys ---
+          {
+            echo "LXD_CLIENT_CERT<<__EOF__"
+            echo "$LXD" | jq -r '.client_cert'
+            echo "__EOF__"
+          } >> $GITHUB_ENV
+
+          {
+            echo "LXD_CLIENT_KEY<<__EOF__"
+            echo "$LXD" | jq -r '.client_key'
+            echo "__EOF__"
+          } >> $GITHUB_ENV
+
+          {
+            echo "ANSIBLE_SSH_PUBLIC_KEY<<__EOF__"
+            echo "$ANSIBLE" | jq -r '.ssh_public_key'
+            echo "__EOF__"
+          } >> $GITHUB_ENV
+
+          {
+            echo "ANSIBLE_SSH_PRIVATE_KEY<<__EOF__"
+            echo "$ANSIBLE" | jq -r '.ssh_private_key'
+            echo "__EOF__"
+          } >> $GITHUB_ENV
+
+      # -------------------------------------------------------------------
+      # Debug — remove after confirming secrets are populated correctly
+      # -------------------------------------------------------------------
+      - name: Debug env
+        run: |
+          echo "MINIO_ENDPOINT=${MINIO_ENDPOINT}"
+          echo "MINIO_ACCESS_KEY length=${#MINIO_ACCESS_KEY}"
+          echo "MINIO_SECRET_KEY length=${#MINIO_SECRET_KEY}"
+
+      # -------------------------------------------------------------------
+      # Setup LXD Certificates
+      # Condition checks env (not secrets) since values are now in GITHUB_ENV.
+      # -------------------------------------------------------------------
+      - name: Setup LXD Certs
+        if: ${{ env.LXD_CLIENT_CERT != '' && env.LXD_CLIENT_KEY != '' }}
+        run: |
+          mkdir -p ~/.config/lxc
+          printf "%s" "$LXD_CLIENT_CERT" > ~/.config/lxc/client.crt
+          printf "%s" "$LXD_CLIENT_KEY"  > ~/.config/lxc/client.key
+          chmod 600 ~/.config/lxc/client.key
+
+      # -------------------------------------------------------------------
+      # Setup Terraform
+      # -------------------------------------------------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      # -------------------------------------------------------------------
+      # Terraform Init (S3 backend via MinIO)
+      # All backend credentials come from GITHUB_ENV set above.
+      # -------------------------------------------------------------------
+      - name: Terraform Init
+        working-directory: ${{ steps.vars.outputs.working_dir }}
+        run: |
+          terraform init \
+            -backend-config="endpoint=${MINIO_ENDPOINT}" \
+            -backend-config="bucket=terraform-state" \
+            -backend-config="key=${{ steps.vars.outputs.state_key }}" \
+            -backend-config="region=us-east-1" \
+            -backend-config="access_key=${MINIO_ACCESS_KEY}" \
+            -backend-config="secret_key=${MINIO_SECRET_KEY}" \
+            -backend-config="skip_credentials_validation=true" \
+            -backend-config="skip_metadata_api_check=true" \
+            -backend-config="skip_requesting_account_id=true" \
+            -backend-config="force_path_style=true"
+
+      # -------------------------------------------------------------------
+      # Terraform Validate
+      # -------------------------------------------------------------------
+      - name: Terraform Validate
+        working-directory: ${{ steps.vars.outputs.working_dir }}
+        run: terraform validate
+
+      # -------------------------------------------------------------------
+      # Terraform Plan
+      # TF_VAR_* env vars map directly to Terraform input variables.
+      # -------------------------------------------------------------------
+      - name: Terraform Plan
+        working-directory: ${{ steps.vars.outputs.working_dir }}
+        env:
+          TF_VAR_lxd_address:            ${{ env.LXD_ADDRESS }}
+          TF_VAR_ansible_ssh_public_key: ${{ env.ANSIBLE_SSH_PUBLIC_KEY }}
+          TF_VAR_environment:            ${{ inputs.environment }}
+          TF_VAR_vm_name:                ${{ inputs.vm_name }}
+          # TF_VAR_lxd_trust_password:  ${{ env.LXD_TRUST_PASSWORD }}  # enable if using password auth
+        run: |
+          terraform plan \
+            -var-file="${{ steps.vars.outputs.tfvars_file }}"
