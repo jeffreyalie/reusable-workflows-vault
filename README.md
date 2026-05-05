@@ -1,182 +1,261 @@
-# Reusable Workflows Documentation
+# Reusable Workflows — Vault (OpenBao)
 
-This repository provides a set of reusable GitHub Actions / Gitea Actions workflows that can be called from other repositories to standardize CI/CD pipelines.
+Shared Gitea Actions reusable workflows for the `Infra` org. This is the **default** workflow repo — all secrets are fetched at runtime from **OpenBao** (Vault-compatible) via AppRole authentication. No infrastructure credentials are stored as Gitea secrets.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Prerequisites](#prerequisites)
+- [Secret Management — OpenBao](#secret-management--openbao)
+- [Workflows](#workflows)
+- [How to Call These Workflows](#how-to-call-these-workflows)
+- [Input Reference](#input-reference)
+- [Repository Structure Requirements](#repository-structure-requirements)
+- [Troubleshooting](#troubleshooting)
+
+---
 
 ## Overview
 
-The reusable workflows are organized into two categories:
+This repo provides a set of `workflow_call`-triggered Gitea Actions workflows that can be called from any repo in the `Infra` org. They handle the full VM lifecycle:
 
-### Terraform Workflows
-- **reusable-terraform-check.yml** - Format, validate, and lint Terraform code
-- **reusable-terraform-plan.yml** - Plan infrastructure changes with MinIO backend
-- **reusable-terraform-apply.yml** - Apply infrastructure changes
-- **reusable-terraform-destroy.yml** - Destroy infrastructure
-- **reusable-terraform-init.yml** - Initialize Terraform with MinIO backend
+| Workflow | Trigger | What it does |
+|---|---|---|
+| `reusable-terraform-check.yml` | `workflow_call` | fmt, validate, tflint — no secrets needed |
+| `reusable-terraform-plan.yml` | `workflow_call` | init + plan against MinIO backend |
+| `reusable-terraform-apply.yml` | `workflow_call` | init + apply against MinIO backend |
+| `reusable-terraform-destroy.yml` | `workflow_call` | init + destroy with confirmation gate |
+| `reusable-terraform-init.yml` | `workflow_call` | init only — outputs working_dir and state_key |
+| `reusable-ansible-check.yml` | `workflow_call` | lint + syntax-check, installs Galaxy roles |
+| `reusable-ansible-deploy.yml` | `workflow_call` | init TF state → get VM IP → SSH wait → deploy |
 
-### Ansible Workflows
-- **reusable-ansible-check.yml** - Lint and syntax check Ansible playbooks
-- **reusable-ansible-deploy.yml** - Deploy infrastructure using Ansible
+**Key difference from `reusable-workflows`:** All credentials are read from OpenBao KV at runtime. The only Gitea org secrets required are the three AppRole credentials (`VAULT_ADDR`, `VAULT_ROLE_ID`, `VAULT_SECRET_ID`). Everything else — LXD certs, MinIO keys, SSH keys — lives inside OpenBao.
 
 ---
 
-## Usage Guide
+## Prerequisites
 
-### For Terraform Workflows
+| Requirement | Notes |
+|---|---|
+| OpenBao running | Accessible from the Gitea runner (e.g. `http://10.x.x.x:8200`) |
+| AppRole auth enabled | Role must have read access to the KV paths below |
+| KV v2 secrets engine | Mounted and populated at `homelab/` path |
+| Gitea org secrets | Only three: `VAULT_ADDR`, `VAULT_ROLE_ID`, `VAULT_SECRET_ID` |
+| MinIO | S3-compatible state backend, bucket `terraform-state` must exist |
+| Gitea Act Runner | Docker-based runner registered to the `Infra` org |
 
-#### 1. Terraform Check (PR Validation)
+---
 
-Call this in a PR workflow to validate Terraform code:
+## Secret Management — OpenBao
 
-```yaml
-name: "Terraform Check"
+All infrastructure credentials are stored in OpenBao KV v2. The workflows log in via AppRole, fetch secrets, export them to `$GITHUB_ENV`, and use them for all subsequent steps.
 
-on:
-  pull_request:
-  workflow_dispatch:
+### Required Gitea Org Secrets
 
-jobs:
-  check:
-    uses: <owner>/<repo>/.gitea/workflows/reusable-terraform-check.yml@main
-    with:
-      terraform_dir: "terraform"  # optional, defaults to "terraform"
+Set these three once at `Infra` org → Settings → Secrets:
+
+| Secret | Description |
+|---|---|
+| `VAULT_ADDR` | OpenBao server URL (e.g. `http://10.248.42.x:8200`) |
+| `VAULT_ROLE_ID` | AppRole Role ID |
+| `VAULT_SECRET_ID` | AppRole Secret ID |
+
+### KV v2 Secret Paths
+
+Populate these paths in OpenBao before running any workflow:
+
+**`homelab/data/lxd`**
+| Key | Value |
+|---|---|
+| `address` | LXD API host IP |
+| `client_cert` | Full PEM content of `gitea-runner.crt` |
+| `client_key` | Full PEM content of `gitea-runner.key` |
+| `trust_password` | LXD trust password *(optional, only if not using certs)* |
+
+**`homelab/data/minio`**
+| Key | Value |
+|---|---|
+| `endpoint` | MinIO S3 API URL (e.g. `http://10.248.42.22:9000`) |
+| `access_key` | MinIO access key |
+| `secret_key` | MinIO secret key |
+
+**`homelab/data/ansible`**
+| Key | Value |
+|---|---|
+| `ssh_public_key` | Full public key injected into VMs via cloud-init |
+| `ssh_private_key` | Full private key used by the runner to SSH into VMs |
+
+### How the AppRole Login Works
+
+Each workflow runs this pattern before any infrastructure step:
+
+```bash
+# 1. Exchange AppRole creds for a short-lived token
+VAULT_TOKEN=$(curl -sk "${VAULT_ADDR}/v1/auth/approle/login" \
+  --data '{"role_id":"...","secret_id":"..."}' \
+  | jq -r '.auth.client_token')
+
+# 2. Read KV v2 paths and export to GITHUB_ENV
+curl -sk -H "X-Vault-Token: ${VAULT_TOKEN}" \
+  "${VAULT_ADDR}/v1/homelab/data/lxd" | jq -r '.data.data'
 ```
 
-#### 2. Terraform Plan
+Multiline values (PEM certs, SSH keys) are written using the `<<__EOF__` heredoc syntax to avoid newline corruption in `$GITHUB_ENV`.
 
-Trigger a Terraform plan for a specific environment:
+### Configuring Custom Vault Paths
+
+The default KV paths (`homelab/data/lxd`, `homelab/data/minio`, `homelab/data/ansible`) can be overridden per-call via `vault_path_*` inputs:
 
 ```yaml
-name: "Terraform Plan"
-
-on:
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: "Environment (dev/prod)"
-        required: true
-        type: string
-      vm_name:
-        description: "VM name (e.g., dev01, prod01)"
-        required: true
-
 jobs:
   plan:
-    uses: <owner>/<repo>/.gitea/workflows/reusable-terraform-plan.yml@main
+    uses: Infra/reusable-workflows-vault/.gitea/workflows/reusable-terraform-plan.yml@main
     with:
-      environment: ${{ github.event.inputs.environment }}
-      vm_name: ${{ github.event.inputs.vm_name }}
-    secrets:
-      MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
-      MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
-      MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
-      LXD_ADDRESS: ${{ secrets.LXD_ADDRESS }}
-      ANSIBLE_SSH_PUBLIC_KEY: ${{ secrets.ANSIBLE_SSH_PUBLIC_KEY }}
-      LXD_TRUST_PASSWORD: ${{ secrets.LXD_TRUST_PASSWORD }}
-```
-
-#### 3. Terraform Apply
-
-Apply Terraform changes:
-
-```yaml
-name: "Terraform Apply"
-
-on:
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: "Environment (dev/prod)"
-        required: true
-        type: string
-      vm_name:
-        description: "VM name (e.g., dev01, prod01)"
-        required: true
-
-jobs:
-  apply:
-    uses: <owner>/<repo>/.gitea/workflows/reusable-terraform-apply.yml@main
-    with:
-      environment: ${{ github.event.inputs.environment }}
-      vm_name: ${{ github.event.inputs.vm_name }}
-    secrets:
-      MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
-      MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
-      MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
-      LXD_ADDRESS: ${{ secrets.LXD_ADDRESS }}
-      ANSIBLE_SSH_PUBLIC_KEY: ${{ secrets.ANSIBLE_SSH_PUBLIC_KEY }}
-      LXD_TRUST_PASSWORD: ${{ secrets.LXD_TRUST_PASSWORD }}
-      LXD_CLIENT_CERT: ${{ secrets.LXD_CLIENT_CERT }}
-      LXD_CLIENT_KEY: ${{ secrets.LXD_CLIENT_KEY }}
-```
-
-#### 4. Terraform Destroy
-
-Destroy infrastructure (with confirmation):
-
-```yaml
-name: "Terraform Destroy"
-
-on:
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: "Environment (dev/prod)"
-        required: true
-        type: string
-      vm_name:
-        description: "VM name (e.g., dev01, prod01)"
-        required: true
-      confirm_destroy:
-        description: "Type 'yes' to confirm destroy"
-        required: true
-
-jobs:
-  destroy:
-    uses: <owner>/<repo>/.gitea/workflows/reusable-terraform-destroy.yml@main
-    with:
-      environment: ${{ github.event.inputs.environment }}
-      vm_name: ${{ github.event.inputs.vm_name }}
-      confirm_destroy: ${{ github.event.inputs.confirm_destroy }}
-    secrets:
-      MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
-      MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
-      MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
-      LXD_ADDRESS: ${{ secrets.LXD_ADDRESS }}
-      ANSIBLE_SSH_PUBLIC_KEY: ${{ secrets.ANSIBLE_SSH_PUBLIC_KEY }}
-      LXD_TRUST_PASSWORD: ${{ secrets.LXD_TRUST_PASSWORD }}
-      LXD_CLIENT_CERT: ${{ secrets.LXD_CLIENT_CERT }}
-      LXD_CLIENT_KEY: ${{ secrets.LXD_CLIENT_KEY }}
+      environment:        "prod"
+      vm_name:            "prod01"
+      vault_path_lxd:     "production/data/lxd"      # override default
+      vault_path_minio:   "production/data/minio"
+      vault_path_ansible: "production/data/ansible"
+    secrets: inherit
 ```
 
 ---
 
-### For Ansible Workflows
+## Workflows
 
-#### 1. Ansible Check (PR Validation)
+### `reusable-terraform-check.yml`
 
-Call this in a PR workflow to validate Ansible code:
+Validates Terraform code. Requires no secrets — safe to call on any branch.
+
+Steps: `fmt -check` → `init -backend=false` → `validate` → `tflint`
 
 ```yaml
-name: "Ansible Check"
+jobs:
+  check:
+    uses: Infra/reusable-workflows-vault/.gitea/workflows/reusable-terraform-check.yml@main
+    with:
+      terraform_dir: "terraform"   # optional, default: "terraform"
+```
 
+---
+
+### `reusable-terraform-plan.yml`
+
+Fetches secrets from OpenBao, writes LXD certs, inits Terraform against MinIO, validates, and runs plan.
+
+```yaml
+jobs:
+  plan:
+    uses: Infra/reusable-workflows-vault/.gitea/workflows/reusable-terraform-plan.yml@main
+    with:
+      environment:        ${{ github.event.inputs.environment }}
+      vm_name:            ${{ github.event.inputs.vm_name }}
+      vault_path_lxd:     "homelab/data/lxd"      # optional
+      vault_path_minio:   "homelab/data/minio"     # optional
+      vault_path_ansible: "homelab/data/ansible"   # optional
+    secrets: inherit
+```
+
+---
+
+### `reusable-terraform-apply.yml`
+
+Same flow as plan, runs `terraform apply -auto-approve`.
+
+```yaml
+jobs:
+  apply:
+    uses: Infra/reusable-workflows-vault/.gitea/workflows/reusable-terraform-apply.yml@main
+    with:
+      environment:        ${{ github.event.inputs.environment }}
+      vm_name:            ${{ github.event.inputs.vm_name }}
+      vault_path_lxd:     "homelab/data/lxd"
+      vault_path_minio:   "homelab/data/minio"
+      vault_path_ansible: "homelab/data/ansible"
+    secrets: inherit
+```
+
+---
+
+### `reusable-terraform-destroy.yml`
+
+Hard-gates on `confirm_destroy == "yes"` before proceeding. Fetches secrets, inits, destroys.
+
+```yaml
+jobs:
+  destroy:
+    uses: Infra/reusable-workflows-vault/.gitea/workflows/reusable-terraform-destroy.yml@main
+    with:
+      environment:        ${{ github.event.inputs.environment }}
+      vm_name:            ${{ github.event.inputs.vm_name }}
+      confirm_destroy:    ${{ github.event.inputs.confirm_destroy }}
+      vault_path_lxd:     "homelab/data/lxd"
+      vault_path_minio:   "homelab/data/minio"
+      vault_path_ansible: "homelab/data/ansible"
+    secrets: inherit
+```
+
+---
+
+### `reusable-ansible-check.yml`
+
+Installs Ansible, installs Galaxy roles from `ansible/requirements.yml` (if present), runs lint and syntax-check.
+
+```yaml
+jobs:
+  check:
+    uses: Infra/reusable-workflows-vault/.gitea/workflows/reusable-ansible-check.yml@main
+    with:
+      ansible_playbook_path: "ansible/playbook.yml"   # optional
+```
+
+---
+
+### `reusable-ansible-deploy.yml`
+
+Fetches secrets from OpenBao → installs Galaxy roles → inits Terraform → reads VM IP from state → waits for SSH → deploys playbook.
+
+```yaml
+jobs:
+  deploy:
+    uses: Infra/reusable-workflows-vault/.gitea/workflows/reusable-ansible-deploy.yml@main
+    with:
+      environment:              ${{ github.event.inputs.environment }}
+      vm_name:                  ${{ github.event.inputs.vm_name }}
+      ansible_playbook_path:    "ansible/playbook.yml"   # optional
+      ssh_wait_timeout_seconds: 200                       # optional
+      vault_path_lxd:           "homelab/data/lxd"
+      vault_path_minio:         "homelab/data/minio"
+      vault_path_ansible:       "homelab/data/ansible"
+    secrets: inherit
+```
+
+---
+
+## How to Call These Workflows
+
+### Full Example — All Six Caller Workflows
+
+Create these files in your repo under `.gitea/workflows/`:
+
+**`terraform-check.yml`**
+```yaml
+name: "Terraform Check"
 on:
   pull_request:
   workflow_dispatch:
-
 jobs:
   check:
-    uses: <owner>/<repo>/.gitea/workflows/reusable-ansible-check.yml@main
+    uses: Infra/reusable-workflows-vault/.gitea/workflows/reusable-terraform-check.yml@main
     with:
-      ansible_playbook_path: "ansible/playbook.yml"  # optional
+      terraform_dir: "terraform"
 ```
 
-#### 2. Ansible Deploy
-
-Deploy using Ansible playbook:
-
+**`terraform-plan.yml`**
 ```yaml
-name: "Ansible Deploy"
-
+name: "Terraform Plan"
 on:
   workflow_dispatch:
     inputs:
@@ -185,184 +264,154 @@ on:
         required: true
         type: string
       vm_name:
-        description: "VM name (e.g., dev01, prod01)"
+        description: "VM name (e.g. dev01)"
         required: true
+        type: string
+jobs:
+  plan:
+    uses: Infra/reusable-workflows-vault/.gitea/workflows/reusable-terraform-plan.yml@main
+    with:
+      environment:        ${{ github.event.inputs.environment }}
+      vm_name:            ${{ github.event.inputs.vm_name }}
+      vault_path_lxd:     "homelab/data/lxd"
+      vault_path_minio:   "homelab/data/minio"
+      vault_path_ansible: "homelab/data/ansible"
+    secrets: inherit
+```
 
+**`terraform-apply.yml`** — same shape as plan, replace `reusable-terraform-plan` with `reusable-terraform-apply`.
+
+**`terraform-destroy.yml`** — add `confirm_destroy` input and pass to `reusable-terraform-destroy`.
+
+**`ansible-check.yml`**
+```yaml
+name: "Ansible Check"
+on:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  check:
+    uses: Infra/reusable-workflows-vault/.gitea/workflows/reusable-ansible-check.yml@main
+    with:
+      ansible_playbook_path: "ansible/playbook.yml"
+```
+
+**`ansible-deploy.yml`**
+```yaml
+name: "Ansible Deploy"
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        required: true
+        type: string
+      vm_name:
+        required: true
+        type: string
 jobs:
   deploy:
-    uses: <owner>/<repo>/.gitea/workflows/reusable-ansible-deploy.yml@main
+    uses: Infra/reusable-workflows-vault/.gitea/workflows/reusable-ansible-deploy.yml@main
     with:
-      environment: ${{ github.event.inputs.environment }}
-      vm_name: ${{ github.event.inputs.vm_name }}
-      ansible_playbook_path: "ansible/playbook.yml"
-      ssh_wait_timeout_seconds: 200
-    secrets:
-      MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
-      MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
-      MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
-      LXD_ADDRESS: ${{ secrets.LXD_ADDRESS }}
-      ANSIBLE_SSH_PUBLIC_KEY: ${{ secrets.ANSIBLE_SSH_PUBLIC_KEY }}
-      ANSIBLE_SSH_PRIVATE_KEY: ${{ secrets.ANSIBLE_SSH_PRIVATE_KEY }}
+      environment:        ${{ github.event.inputs.environment }}
+      vm_name:            ${{ github.event.inputs.vm_name }}
+      vault_path_lxd:     "homelab/data/lxd"
+      vault_path_minio:   "homelab/data/minio"
+      vault_path_ansible: "homelab/data/ansible"
+    secrets: inherit
 ```
 
 ---
 
-## Required Secrets
-
-When using these reusable workflows, ensure the following secrets are configured in your repository:
+## Input Reference
 
 ### Terraform Workflows
-- `MINIO_ENDPOINT` - MinIO S3 endpoint for Terraform state
-- `MINIO_ACCESS_KEY` - MinIO access key
-- `MINIO_SECRET_KEY` - MinIO secret key
-- `LXD_ADDRESS` - LXD server address
-- `ANSIBLE_SSH_PUBLIC_KEY` - Ansible SSH public key
-- `LXD_TRUST_PASSWORD` - LXD trust password
-- `LXD_CLIENT_CERT` - (Optional) LXD client certificate
-- `LXD_CLIENT_KEY` - (Optional) LXD client key
+
+| Input | Required | Default | Description |
+|---|---|---|---|
+| `environment` | Yes | — | `dev` or `prod` |
+| `vm_name` | Yes | — | Matches `.tfvars` filename (e.g. `dev01`) |
+| `terraform_version` | No | latest | Pin a specific Terraform version |
+| `terraform_dir` | No | `terraform` | Root dir for fmt/validate (check workflow only) |
+| `confirm_destroy` | Yes* | — | Must be `yes` (destroy workflow only) |
+| `vault_path_lxd` | No | `homelab/data/lxd` | KV v2 path for LXD secrets |
+| `vault_path_minio` | No | `homelab/data/minio` | KV v2 path for MinIO secrets |
+| `vault_path_ansible` | No | `homelab/data/ansible` | KV v2 path for Ansible secrets |
 
 ### Ansible Workflows
-- `MINIO_ENDPOINT` - MinIO S3 endpoint
-- `MINIO_ACCESS_KEY` - MinIO access key
-- `MINIO_SECRET_KEY` - MinIO secret key
-- `LXD_ADDRESS` - LXD server address
-- `ANSIBLE_SSH_PUBLIC_KEY` - Ansible SSH public key
-- `ANSIBLE_SSH_PRIVATE_KEY` - Ansible SSH private key
+
+| Input | Required | Default | Description |
+|---|---|---|---|
+| `environment` | Yes | — | `dev` or `prod` |
+| `vm_name` | Yes | — | Target VM name |
+| `ansible_playbook_path` | No | `ansible/playbook.yml` | Path to playbook |
+| `ssh_wait_timeout_seconds` | No | `200` | Max seconds to wait for SSH |
+| `vault_path_*` | No | `homelab/data/*` | Override KV paths (deploy workflow) |
 
 ---
 
 ## Repository Structure Requirements
 
-When using these workflows, ensure your repository follows this structure:
+Calling repos must follow this layout:
 
 ```
 your-repo/
 ├── terraform/
 │   ├── env/
 │   │   ├── dev/
+│   │   │   ├── backend.tf      # terraform { backend "s3" {} }
+│   │   │   ├── providers.tf
 │   │   │   ├── main.tf
 │   │   │   ├── variables.tf
-│   │   │   ├── outputs.tf
-│   │   │   ├── providers.tf
+│   │   │   ├── outputs.tf      # must expose vm_ip output
 │   │   │   └── dev01.tfvars
 │   │   └── prod/
-│   │       ├── main.tf
-│   │       ├── variables.tf
-│   │       ├── outputs.tf
-│   │       ├── providers.tf
 │   │       └── prod01.tfvars
-│   └── modules/
-│       └── (your modules)
-├── ansible/
-│   ├── playbook.yml
-│   ├── inventory.yml
-│   └── roles/
-└── .gitea/workflows/
-    ├── terraform-check.yml
-    ├── terraform-plan.yml
-    ├── terraform-apply.yml
-    ├── terraform-destroy.yml
-    ├── ansible-check.yml
-    ├── ansible-deploy.yml
-    └── reusable-*.yml
+│   └── modules/                # only needed if using local module
+└── ansible/
+    ├── playbook.yml
+    ├── requirements.yml        # Galaxy roles (optional)
+    └── roles/                  # local roles (optional)
 ```
 
----
-
-## Input Parameters
-
-### Terraform Workflows
-
-| Input | Required | Type | Description |
-|-------|----------|------|-------------|
-| `environment` | Yes | string | Environment name (dev, prod) |
-| `vm_name` | Yes | string | VM name matching tfvars file (dev01, prod01) |
-| `terraform_version` | No | string | Terraform version (defaults to latest) |
-| `terraform_dir` | No | string | Terraform directory (defaults to "terraform") |
-| `confirm_destroy` | Yes* | string | Must be "yes" for destroy workflows |
-
-*Only required for destroy workflow
-
-### Ansible Workflows
-
-| Input | Required | Type | Description |
-|-------|----------|------|-------------|
-| `environment` | Yes | string | Environment name (dev, prod) |
-| `vm_name` | Yes | string | VM name matching tfvars file |
-| `ansible_playbook_path` | No | string | Path to playbook (defaults to "ansible/playbook.yml") |
-| `ssh_wait_timeout_seconds` | No | number | SSH wait timeout in seconds (default: 200) |
-
----
-
-## Workflow Validation
-
-All workflows validate inputs before execution:
-
-- **Environment validation**: Only allows "dev" or "prod"
-- **tfvars file validation**: Checks that the tfvars file exists
-- **Terraform validation**: Runs format, init, and validate checks
-- **Ansible validation**: Runs lint and syntax checks
-- **Destroy confirmation**: Requires "yes" confirmation for safety
-
----
-
-## How to Import Into Your Repository
-
-To use these reusable workflows in your repository:
-
-1. **Update your caller workflows** to reference the reusable workflows:
-   ```yaml
-   jobs:
-     check:
-       uses: <owner>/<repo>/.gitea/workflows/reusable-terraform-check.yml@<branch>
-   ```
-
-2. **Replace `<owner>/<repo>`** with the actual repository reference
-
-3. **Use `@main`** or a specific branch/tag for version pinning
-
-4. **Configure secrets** in your repository settings
-
-5. **Ensure directory structure** matches the requirements above
-
----
-
-## Customization
-
-To customize these workflows for your use case:
-
-1. Copy the reusable workflow YAML to your repository
-2. Modify the environment validation, paths, or steps as needed
-3. Update the `uses:` directive in your caller workflows
+State path convention (auto-derived from inputs):
+```
+s3://terraform-state/state/<environment>/<vm_name>/terraform.tfstate
+```
 
 ---
 
 ## Troubleshooting
 
-### Common Issues
+**OpenBao login fails (`Failed to authenticate with OpenBao`)**
+- Verify `VAULT_ADDR`, `VAULT_ROLE_ID`, `VAULT_SECRET_ID` are set correctly in Gitea org secrets
+- Check OpenBao is reachable from the runner: `curl -sk $VAULT_ADDR/v1/sys/health`
+- Confirm the AppRole has read policy on `homelab/data/*`
 
-**Reusable workflow not found**
-- Ensure the path includes `.gitea/workflows/` or `.github/workflows/`
-- Verify the workflow file exists in the referenced branch
-- Check that the branch name in `@branch` is correct
+**Multiline secret corruption (PEM cert / SSH key broken)**
+- The workflow uses `<<__EOF__` heredoc syntax in `$GITHUB_ENV` — do not modify this pattern
+- Verify the KV value was stored with full PEM including `-----BEGIN/END-----` lines
 
-**Missing secrets**
-- Verify all required secrets are set in repository settings
-- Check secret names match exactly (case-sensitive)
-- Ensure secrets are inherited if using organization-level secrets
+**`tfvars file not found`**
+- The `vm_name` input must exactly match a `.tfvars` filename under `terraform/env/<env>/`
+- Example: input `dev01` → expects `terraform/env/dev/dev01.tfvars`
 
-**Terraform init failures**
-- Verify MinIO credentials and endpoint
-- Ensure MinIO bucket "terraform-state" exists
-- Check network connectivity to MinIO server
+**Terraform init fails (MinIO)**
+- Check `homelab/data/minio` keys: `endpoint`, `access_key`, `secret_key`
+- Ensure bucket `terraform-state` exists in MinIO
 
-**Ansible deployment failures**
-- Verify SSH keys are correct and have proper permissions
-- Ensure VM IP is accessible from runner
-- Check Ansible playbook syntax with the check workflow first
+**LXD cert setup skipped**
+- The `Setup LXD Certs` step is conditional on `env.LXD_CLIENT_CERT != ''`
+- If OpenBao returns an empty `client_cert`, check the KV key name is exactly `client_cert`
 
 ---
 
-## Support
+## Infrastructure Created and Maintained By
 
-For issues or questions, refer to the original workflow implementations or contact the repository maintainer.
+**Ali Ahmed**  
+Building infrastructure, automation, and DevOps workflows
+
+**Contact**
+
+[![GitHub](https://img.shields.io/badge/GitHub-%20ali%20ahmed-black?style=for-the-badge&logo=github)](https://github.com/jeffreyalie)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-%20ali%20ahmed-blue?style=for-the-badge&logo=linkedin)](https://www.linkedin.com/in/ali-ahmed-261755252/)
+
