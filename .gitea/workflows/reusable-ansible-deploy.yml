@@ -1,0 +1,250 @@
+name: "Reusable Ansible Deploy"
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Environment name (e.g., dev, prod)"
+        required: true
+        type: string
+      vm_name:
+        description: "VM name (e.g., dev01, prod01)"
+        required: true
+        type: string
+      ansible_playbook_path:
+        description: "Path to Ansible playbook (e.g., ansible/playbook.yml)"
+        required: false
+        type: string
+        default: "ansible/playbook.yml"
+      terraform_version:
+        description: "Optional Terraform version (defaults to latest)"
+        required: false
+        type: string
+        default: ""
+      ssh_wait_timeout_seconds:
+        description: "Seconds to wait for SSH to be ready (default 200)"
+        required: false
+        type: number
+        default: 200
+      vault_path_lxd:
+        description: "KV v2 path for LXD secrets (full path after /v1/)"
+        required: false
+        type: string
+        default: "homelab/data/lxd"
+      vault_path_minio:
+        description: "KV v2 path for MinIO secrets (full path after /v1/)"
+        required: false
+        type: string
+        default: "homelab/data/minio"
+      vault_path_ansible:
+        description: "KV v2 path for Ansible secrets (full path after /v1/)"
+        required: false
+        type: string
+        default: "homelab/data/ansible"
+    secrets:
+      VAULT_ADDR:
+        required: true
+      VAULT_ROLE_ID:
+        required: true
+      VAULT_SECRET_ID:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          clean: true  # This removes untracked files from previous runs
+
+      # -------------------------------------------------------------------
+      # Validate Environment
+      # -------------------------------------------------------------------
+      - name: Validate Environment
+        run: |
+          ENV="${{ inputs.environment }}"
+          if [ "$ENV" != "dev" ] && [ "$ENV" != "prod" ]; then
+            echo "::error:: Invalid environment: $ENV (must be dev or prod)"
+            exit 1
+          fi
+
+      # -------------------------------------------------------------------
+      # Fetch Secrets from OpenBao
+      # Logs in via AppRole, reads lxd/minio/ansible KV paths, exports
+      # all values to $GITHUB_ENV for every subsequent step.
+      # Multiline values (PEM certs, SSH keys) use the EOF delimiter syntax
+      # to avoid newline corruption in GITHUB_ENV.
+      # curl -sk skips TLS verification for self-signed internal certs.
+      # VAULT_ADDR/ROLE_ID/SECRET_ID come from org secrets via inherit.
+      # -------------------------------------------------------------------
+      - name: Fetch Secrets from OpenBao
+        env:
+          VAULT_ADDR:      ${{ secrets.VAULT_ADDR }}
+          VAULT_ROLE_ID:   ${{ secrets.VAULT_ROLE_ID }}
+          VAULT_SECRET_ID: ${{ secrets.VAULT_SECRET_ID }}
+          PATH_LXD:        ${{ inputs.vault_path_lxd }}
+          PATH_MINIO:      ${{ inputs.vault_path_minio }}
+          PATH_ANSIBLE:    ${{ inputs.vault_path_ansible }}
+        run: |
+          set -euo pipefail
+
+          # --- Login: exchange AppRole creds for a short-lived token ---
+          VAULT_TOKEN=$(curl -sk "${VAULT_ADDR}/v1/auth/approle/login" \
+            --data "{\"role_id\":\"${VAULT_ROLE_ID}\",\"secret_id\":\"${VAULT_SECRET_ID}\"}" \
+            | jq -r '.auth.client_token')
+
+          if [ -z "$VAULT_TOKEN" ] || [ "$VAULT_TOKEN" = "null" ]; then
+            echo "::error:: Failed to authenticate with OpenBao"
+            exit 1
+          fi
+
+          # --- Helper: read a KV v2 path, return .data.data as JSON ---
+          vault_read() {
+            RESPONSE=$(curl -sk -H "X-Vault-Token: ${VAULT_TOKEN}" \
+              "${VAULT_ADDR}/v1/$1") || {
+              echo "::error:: Failed to read vault path: $1"
+              exit 1
+            }
+            echo "$RESPONSE" | jq -r '.data.data'
+          }
+
+          LXD=$(vault_read     "$PATH_LXD")
+          MINIO=$(vault_read   "$PATH_MINIO")
+          ANSIBLE=$(vault_read "$PATH_ANSIBLE")
+
+          # --- Scalar values ---
+          echo "LXD_ADDRESS=$(echo "$LXD"        | jq -r '.address')"                  >> $GITHUB_ENV
+          echo "MINIO_ENDPOINT=$(echo "$MINIO"    | jq -r '.endpoint')"                >> $GITHUB_ENV
+          echo "MINIO_ACCESS_KEY=$(echo "$MINIO"  | jq -r '.access_key')"              >> $GITHUB_ENV
+          echo "MINIO_SECRET_KEY=$(echo "$MINIO"  | jq -r '.secret_key')"              >> $GITHUB_ENV
+
+          # --- Multiline values: SSH keys ---
+          {
+            echo "ANSIBLE_SSH_PUBLIC_KEY<<__EOF__"
+            echo "$ANSIBLE" | jq -r '.ssh_public_key'
+            echo "__EOF__"
+          } >> $GITHUB_ENV
+
+          {
+            echo "ANSIBLE_SSH_PRIVATE_KEY<<__EOF__"
+            echo "$ANSIBLE" | jq -r '.ssh_private_key'
+            echo "__EOF__"
+          } >> $GITHUB_ENV
+
+      # -------------------------------------------------------------------
+      # Install Dependencies
+      # -------------------------------------------------------------------
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible netcat-openbsd git
+
+      # -------------------------------------------------------------------
+      # Install Ansible Roles
+      # -------------------------------------------------------------------
+      - name: Install Ansible Roles
+        run: |
+          if [ -f ansible/requirements.yml ]; then
+            echo "requirements.yml found, installing roles..."
+            ansible-galaxy role install --force -r ansible/requirements.yml
+          else
+            echo "No requirements.yml found, skipping..."
+          fi
+
+      # -------------------------------------------------------------------
+      # Set Variables
+      # -------------------------------------------------------------------
+      - name: Set Variables
+        id: vars
+        run: |
+          ENV="${{ inputs.environment }}"
+          VM="${{ inputs.vm_name }}"
+          echo "env=$ENV"                                        >> $GITHUB_OUTPUT
+          echo "vm_name=$VM"                                     >> $GITHUB_OUTPUT
+          echo "working_dir=terraform/env/${ENV}"                >> $GITHUB_OUTPUT
+          echo "state_key=state/${ENV}/${VM}/terraform.tfstate"  >> $GITHUB_OUTPUT
+
+      # -------------------------------------------------------------------
+      # Setup Terraform
+      # -------------------------------------------------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      # -------------------------------------------------------------------
+      # Terraform Init (S3 backend via MinIO)
+      # All backend credentials come from GITHUB_ENV set above.
+      # -------------------------------------------------------------------
+      - name: Terraform Init
+        working-directory: ${{ steps.vars.outputs.working_dir }}
+        run: |
+          terraform init \
+            -backend-config="endpoint=${MINIO_ENDPOINT}" \
+            -backend-config="bucket=terraform-state" \
+            -backend-config="key=${{ steps.vars.outputs.state_key }}" \
+            -backend-config="region=us-east-1" \
+            -backend-config="access_key=${MINIO_ACCESS_KEY}" \
+            -backend-config="secret_key=${MINIO_SECRET_KEY}" \
+            -backend-config="skip_credentials_validation=true" \
+            -backend-config="skip_metadata_api_check=true" \
+            -backend-config="skip_requesting_account_id=true" \
+            -backend-config="force_path_style=true"
+
+      # -------------------------------------------------------------------
+      # Get VM IP from Terraform Output
+      # -------------------------------------------------------------------
+      - name: Get VM IP
+        id: tfout
+        working-directory: ${{ steps.vars.outputs.working_dir }}
+        run: |
+          IP=$(terraform output -raw vm_ip)
+          echo "vm_ip=$IP" >> $GITHUB_OUTPUT
+
+      # -------------------------------------------------------------------
+      # Wait for SSH
+      # -------------------------------------------------------------------
+      - name: Wait for SSH
+        run: |
+          TIMEOUT=${{ inputs.ssh_wait_timeout_seconds }}
+          ELAPSED=0
+          INTERVAL=10
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            if nc -z ${{ steps.tfout.outputs.vm_ip }} 22 2>/dev/null; then
+              echo "SSH is ready!"
+              exit 0
+            fi
+            echo "Waiting for SSH... ($ELAPSED/$TIMEOUT seconds)"
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+          echo "::error:: SSH not ready after $TIMEOUT seconds"
+          exit 1
+
+      # -------------------------------------------------------------------
+      # Setup SSH Key
+      # Written from GITHUB_ENV populated by Fetch Secrets above.
+      # -------------------------------------------------------------------
+      - name: Setup SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "$ANSIBLE_SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          chmod 700 ~/.ssh
+
+      # -------------------------------------------------------------------
+      # Create Inventory
+      # -------------------------------------------------------------------
+      - name: Create Inventory
+        run: |
+          echo "[vm]" > inventory.ini
+          echo "${{ steps.tfout.outputs.vm_ip }} ansible_user=ansible ansible_ssh_private_key_file=$HOME/.ssh/id_rsa" >> inventory.ini
+
+      # -------------------------------------------------------------------
+      # Ansible Deploy
+      # -------------------------------------------------------------------
+      - name: Ansible Deploy
+        run: |
+          ANSIBLE_HOST_KEY_CHECKING=False \
+          ansible-playbook -i inventory.ini ${{ inputs.ansible_playbook_path }}
