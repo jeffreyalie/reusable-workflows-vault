@@ -21,11 +21,11 @@ on:
         required: false
         type: string
         default: "homelab/data/lxd"
-      vault_path_minio:
+      vault_path_seaweed:
         description: "KV v2 path for MinIO secrets (full path after /v1/)"
         required: false
         type: string
-        default: "homelab/data/minio"
+        default: "homelab/data/seaweed"
       vault_path_ansible:
         description: "KV v2 path for Ansible secrets (full path after /v1/)"
         required: false
@@ -42,6 +42,15 @@ on:
 jobs:
   apply:
     runs-on: ubuntu-latest
+
+    # S3 credentials for the SeaweedFS backend. Terraform reads these from the
+    # environment, so they are available to both `init` and `plan` and are never
+    # written into .terraform/ on disk.
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
@@ -93,7 +102,7 @@ jobs:
           VAULT_ROLE_ID:   ${{ secrets.VAULT_ROLE_ID }}
           VAULT_SECRET_ID: ${{ secrets.VAULT_SECRET_ID }}
           PATH_LXD:        ${{ inputs.vault_path_lxd }}
-          PATH_MINIO:      ${{ inputs.vault_path_minio }}
+          PATH_SEAWEED:      ${{ inputs.vault_path_seaweed }}
           PATH_ANSIBLE:    ${{ inputs.vault_path_ansible }}
         run: |
           set -euo pipefail
@@ -119,15 +128,15 @@ jobs:
           }
 
           LXD=$(vault_read     "$PATH_LXD")
-          MINIO=$(vault_read   "$PATH_MINIO")
+          S3=$(vault_read   "$PATH_SEAWEED")
           ANSIBLE=$(vault_read "$PATH_ANSIBLE")
 
           # --- Scalar values ---
           echo "LXD_ADDRESS=$(echo "$LXD"        | jq -r '.address')"                  >> $GITHUB_ENV
           echo "LXD_TRUST_PASSWORD=$(echo "$LXD"  | jq -r '.trust_password // empty')" >> $GITHUB_ENV
-          echo "MINIO_ENDPOINT=$(echo "$MINIO"    | jq -r '.endpoint')"                >> $GITHUB_ENV
-          echo "MINIO_ACCESS_KEY=$(echo "$MINIO"  | jq -r '.access_key')"              >> $GITHUB_ENV
-          echo "MINIO_SECRET_KEY=$(echo "$MINIO"  | jq -r '.secret_key')"              >> $GITHUB_ENV
+          echo "S3_ENDPOINT=$(echo "$S3"    | jq -r '.endpoint')"                >> $GITHUB_ENV
+          echo "S3_ACCESS_KEY=$(echo "$S3"  | jq -r '.access_key')"              >> $GITHUB_ENV
+          echo "S3_SECRET_KEY=$(echo "$S3"  | jq -r '.secret_key')"              >> $GITHUB_ENV
 
           # --- Multiline values: PEM certs and SSH keys ---
           {
@@ -174,25 +183,34 @@ jobs:
         with:
           terraform_version: ${{ inputs.terraform_version }}
 
+
       # -------------------------------------------------------------------
-      # Terraform Init (S3 backend via MinIO)
-      # All backend credentials come from GITHUB_ENV set above.
+      # Init (S3 backend on SeaweedFS)
+      # Non-secret settings go in a generated backend.hcl file. The access and
+      # secret keys come from the job-level AWS_* environment variables.
       # -------------------------------------------------------------------
       - name: Terraform Init
         working-directory: ${{ steps.vars.outputs.working_dir }}
+        env:
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
         run: |
-          terraform init \
-            -backend-config="endpoint=${MINIO_ENDPOINT}" \
-            -backend-config="bucket=terraform-state" \
-            -backend-config="key=${{ steps.vars.outputs.state_key }}" \
-            -backend-config="region=us-east-1" \
-            -backend-config="access_key=${MINIO_ACCESS_KEY}" \
-            -backend-config="secret_key=${MINIO_SECRET_KEY}" \
-            -backend-config="skip_credentials_validation=true" \
-            -backend-config="skip_metadata_api_check=true" \
-            -backend-config="skip_requesting_account_id=true" \
-            -backend-config="force_path_style=true"
+          cat > backend.hcl <<EOF
+          bucket = "tfstate"
+          key    = "${{ steps.vars.outputs.state_key }}"
+          region = "us-east-1"
 
+          endpoints = { s3 = "${S3_ENDPOINT}" }
+
+          use_path_style              = true
+          use_lockfile                = true
+          skip_credentials_validation = true
+          skip_requesting_account_id  = true
+          skip_metadata_api_check     = true
+          skip_region_validation      = true
+          skip_s3_checksum            = true
+          EOF
+
+          terraform init -backend-config=backend.hcl
       # -------------------------------------------------------------------
       # Terraform Apply
       # TF_VAR_* env vars map directly to Terraform input variables.

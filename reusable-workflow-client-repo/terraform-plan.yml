@@ -14,12 +14,12 @@ on:
 
 jobs:
   plan:
-    uses: Infra/reusable-workflows-vault/.gitea/workflows/reusable-terraform-plan.yml@main
+    uses: admin/reusable-workflows-vault/.gitea/workflows/reusable-terraform-plan.yml@main
     with:
       environment:        ${{ github.event.inputs.environment }}
       vm_name:            ${{ github.event.inputs.vm_name }}
       vault_path_lxd:     "homelab/data/lxd"
-      vault_path_minio:   "homelab/data/minio"
+      vault_path_seaweed:   "homelab/data/seaweed"
       vault_path_ansible: "homelab/data/ansible"
     secrets: inherit
     

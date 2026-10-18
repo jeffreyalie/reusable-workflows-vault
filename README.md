@@ -74,7 +74,7 @@ Populate these paths in OpenBao before running any workflow:
 | `client_key` | Full PEM content of `gitea-runner.key` |
 | `trust_password` | LXD trust password *(optional, only if not using certs)* |
 
-**`homelab/data/minio`**
+**`homelab/data/seaweed`**
 | Key | Value |
 |---|---|
 | `endpoint` | MinIO S3 API URL (e.g. `http://10.248.42.22:9000`) |
@@ -106,7 +106,7 @@ Multiline values (PEM certs, SSH keys) are written using the `<<__EOF__` heredoc
 
 ### Configuring Custom Vault Paths
 
-The default KV paths (`homelab/data/lxd`, `homelab/data/minio`, `homelab/data/ansible`) can be overridden per-call via `vault_path_*` inputs:
+The default KV paths (`homelab/data/lxd`, `homelab/data/seaweed`, `homelab/data/ansible`) can be overridden per-call via `vault_path_*` inputs:
 
 ```yaml
 jobs:
@@ -116,7 +116,7 @@ jobs:
       environment:        "prod"
       vm_name:            "prod01"
       vault_path_lxd:     "production/data/lxd"      # override default
-      vault_path_minio:   "production/data/minio"
+      vault_path_seaweed:   "production/data/minio"
       vault_path_ansible: "production/data/ansible"
     secrets: inherit
 ```
@@ -153,7 +153,7 @@ jobs:
       environment:        ${{ github.event.inputs.environment }}
       vm_name:            ${{ github.event.inputs.vm_name }}
       vault_path_lxd:     "homelab/data/lxd"      # optional
-      vault_path_minio:   "homelab/data/minio"     # optional
+      vault_path_seaweed:   "homelab/data/seaweed"     # optional
       vault_path_ansible: "homelab/data/ansible"   # optional
     secrets: inherit
 ```
@@ -172,7 +172,7 @@ jobs:
       environment:        ${{ github.event.inputs.environment }}
       vm_name:            ${{ github.event.inputs.vm_name }}
       vault_path_lxd:     "homelab/data/lxd"
-      vault_path_minio:   "homelab/data/minio"
+      vault_path_seaweed:   "homelab/data/seaweed"
       vault_path_ansible: "homelab/data/ansible"
     secrets: inherit
 ```
@@ -192,7 +192,7 @@ jobs:
       vm_name:            ${{ github.event.inputs.vm_name }}
       confirm_destroy:    ${{ github.event.inputs.confirm_destroy }}
       vault_path_lxd:     "homelab/data/lxd"
-      vault_path_minio:   "homelab/data/minio"
+      vault_path_seaweed:   "homelab/data/seaweed"
       vault_path_ansible: "homelab/data/ansible"
     secrets: inherit
 ```
@@ -227,7 +227,7 @@ jobs:
       ansible_playbook_path:    "ansible/playbook.yml"   # optional
       ssh_wait_timeout_seconds: 200                       # optional
       vault_path_lxd:           "homelab/data/lxd"
-      vault_path_minio:         "homelab/data/minio"
+      vault_path_seaweed:         "homelab/data/seaweed"
       vault_path_ansible:       "homelab/data/ansible"
     secrets: inherit
 ```
@@ -274,7 +274,7 @@ jobs:
       environment:        ${{ github.event.inputs.environment }}
       vm_name:            ${{ github.event.inputs.vm_name }}
       vault_path_lxd:     "homelab/data/lxd"
-      vault_path_minio:   "homelab/data/minio"
+      vault_path_seaweed:   "homelab/data/seaweed"
       vault_path_ansible: "homelab/data/ansible"
     secrets: inherit
 ```
@@ -315,7 +315,7 @@ jobs:
       environment:        ${{ github.event.inputs.environment }}
       vm_name:            ${{ github.event.inputs.vm_name }}
       vault_path_lxd:     "homelab/data/lxd"
-      vault_path_minio:   "homelab/data/minio"
+      vault_path_seaweed:   "homelab/data/seaweed"
       vault_path_ansible: "homelab/data/ansible"
     secrets: inherit
 ```
@@ -334,7 +334,7 @@ jobs:
 | `terraform_dir` | No | `terraform` | Root dir for fmt/validate (check workflow only) |
 | `confirm_destroy` | Yes* | — | Must be `yes` (destroy workflow only) |
 | `vault_path_lxd` | No | `homelab/data/lxd` | KV v2 path for LXD secrets |
-| `vault_path_minio` | No | `homelab/data/minio` | KV v2 path for MinIO secrets |
+| `vault_path_seaweed` | No | `homelab/data/seaweed` | KV v2 path for MinIO secrets |
 | `vault_path_ansible` | No | `homelab/data/ansible` | KV v2 path for Ansible secrets |
 
 ### Ansible Workflows
@@ -396,7 +396,7 @@ s3://terraform-state/state/<environment>/<vm_name>/terraform.tfstate
 - Example: input `dev01` → expects `terraform/env/dev/dev01.tfvars`
 
 **Terraform init fails (MinIO)**
-- Check `homelab/data/minio` keys: `endpoint`, `access_key`, `secret_key`
+- Check `homelab/data/seaweed` keys: `endpoint`, `access_key`, `secret_key`
 - Ensure bucket `terraform-state` exists in MinIO
 
 **LXD cert setup skipped**
