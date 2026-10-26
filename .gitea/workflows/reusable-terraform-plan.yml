@@ -128,7 +128,7 @@ jobs:
           }
 
           LXD=$(vault_read     "$PATH_LXD")
-          MINIO=$(vault_read   "$PATH_SEAWEED")
+          S3=$(vault_read   "$PATH_SEAWEED")
           ANSIBLE=$(vault_read "$PATH_ANSIBLE")
 
           # --- Scalar values ---
